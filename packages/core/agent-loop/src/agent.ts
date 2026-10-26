@@ -19,11 +19,21 @@ import type {
   RequestErrorAction,
 } from '@deepseek-ai/dsh-agent'
 import { AgentModel, agentEvents, assembleContextFor } from '@deepseek-ai/dsh-agent'
-import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@deepseek-ai/dsh-llm'
+import type {
+  FinishReason,
+  GenerateOptions,
+  LlmCallConfig,
+  Message,
+  PreparedLlmCall,
+  TokenUsage,
+  ToolCallBlock,
+  ToolResultMessage,
+} from '@deepseek-ai/dsh-llm'
 import {
   LlmError,
   createAssistantMessage,
   createDeveloperMessage,
+  createToolResultMessage,
   errorChain,
   markAgentLoopRequest,
 } from '@deepseek-ai/dsh-llm'
@@ -73,6 +83,69 @@ type PreparedStep =
     /** Admission shared by the step's declarations and dispatch; the turn disposes it after the step. */
     toolSet: ResolvedToolSet
   }
+
+/** One admitted native assistant request handed to a custom turn driver. */
+export type DriverAssistantAdmission =
+  | { readonly kind: 'blocked' }
+  | { readonly kind: 'empty' }
+  | {
+    readonly kind: 'response'
+    readonly message: ReturnType<typeof createAssistantMessage>
+    readonly finish: FinishReason
+    /** Exact frozen request the response answered, including its canonical transcript and tools. */
+    readonly request: GenerateOptions
+    readonly contextWindow?: number
+    readonly defaultMaxTokens?: number
+    readonly usage?: TokenUsage
+  }
+
+/** The native step/turn surface a custom driver drives through. */
+export interface TurnDriverIO {
+  /** The Agent whose durable Session receives every model/tool event. */
+  readonly agent: ReactLoopAgent
+  /** Open turn number. */
+  readonly turn: number
+  /** Cancellation shared with the Agent loop. */
+  readonly signal: AbortSignal
+  /** Admit and run exactly one native assistant request inside a fresh durable step. */
+  requestAssistant(): Promise<DriverAssistantAdmission>
+  /** Execute one original model tool call and return its durable result message. */
+  executeTool(call: ToolCallBlock): Promise<ToolResultMessage>
+  /** Durably reject one model tool call that never reaches native execution. */
+  rejectTool(call: ToolCallBlock, message: string, code: string): Promise<ToolResultMessage>
+  /** Close the current durable step after its model response and tool batch settled. */
+  completeStep(): Promise<void>
+  /** Whether a successful tool call concluded the turn. */
+  shouldConcludeTurn(): boolean
+  /** Input awaiting the next durable step; admission claims it exactly once. */
+  pendingSteering(): readonly UserMessage[]
+  /** Whether input awaits the next durable step. */
+  hasPendingSteering(): boolean
+  /** Dispatch the Agent turn-stopping hook and report newly admitted steering. */
+  notifyStopping(): Promise<boolean>
+}
+
+/** Result a custom driver reports for the completed turn. */
+export type TurnDriverResult =
+  | { readonly kind: 'completed' }
+  | { readonly kind: 'max-tokens' }
+  | { readonly kind: 'blocked' }
+
+/** A model/tool repetition driver installed by an agent-scoped plugin. */
+export interface TurnDriver {
+  /** Drive the open turn to completion; the core owns turn and step lifecycle. */
+  runTurn(io: TurnDriverIO): Promise<TurnDriverResult>
+}
+
+/** One open durable step owned by a custom driver. */
+interface DriverStep {
+  readonly turn: number
+  readonly step: number
+  readonly decision: Extract<PreparedStep, { kind: 'enter' }>
+  readonly toolRecovery: ToolCallRecovery
+  readonly stopRecovery: () => void
+  closed: boolean
+}
 
 /** Remove adapter-derived values before plugins propose the next request config. */
 function requestProposal(header: EpochHeader): LlmCallConfig {
@@ -341,7 +414,26 @@ export class ReactLoopAgent implements Agent {
     let turnEnds: TurnEndReason | null = null
     let target: InboxTarget = 'next-turn'
     try {
-      while (true) {
+      const driver = this.loopCtx.agentLoop.turnDriverFor(this.ctx)
+      if (driver !== undefined) {
+        const io = this.createTurnDriverIO(turn, signal)
+        let outcome: TurnDriverResult
+        try {
+          outcome = await driver.runTurn(io)
+        } catch (error: unknown) {
+          try {
+            await io.completeStep()
+          } catch (closeError: unknown) {
+            throw new AggregateError([error, closeError], 'Turn driver failed and its open step could not be closed', { cause: error })
+          }
+          throw error
+        }
+        await io.completeStep()
+        turnEnds = outcome.kind === 'max-tokens'
+          ? { kind: 'max-tokens' }
+          : outcome.kind === 'blocked' ? { kind: 'blocked' } : { kind: 'completed' }
+        if (turnEnds.kind === 'blocked') return false
+      } else while (true) {
         signal.throwIfAborted()
         const step = phase.step + 1
         const decision = await this.preStep(target, { turn, step })
@@ -430,6 +522,309 @@ export class ReactLoopAgent implements Agent {
     phase.wakeRequested = false
     phase.step = 0
     return true
+  }
+
+  /** Build the native step/turn surface handed to one installed custom driver. */
+  private createTurnDriverIO(turn: number, signal: AbortSignal): TurnDriverIO {
+    let target: InboxTarget = 'next-turn'
+    let current: DriverStep | undefined
+    let concluded = false
+    const requireStep = (): DriverStep => {
+      if (current === undefined || current.closed) throw new Error(`agent "${this.id}": driver step is not open`)
+      return current
+    }
+    return {
+      agent: this,
+      turn,
+      signal,
+      requestAssistant: async () => {
+        signal.throwIfAborted()
+        const step = this.phase.kind === 'running' ? this.phase.step + 1 : 0
+        const decision = await this.preStep(target, { turn, step })
+        target = 'next-step'
+        if (decision.kind === 'reject') return { kind: 'blocked' }
+        if (step === 1 && decision.messages.length === 0) {
+          decision.toolSet.dispose()
+          return { kind: 'empty' }
+        }
+        signal.throwIfAborted()
+        try {
+          this.session.append('step/start', { turn, step })
+        } catch (error: unknown) {
+          decision.toolSet.dispose()
+          throw error
+        }
+        if (this.phase.kind === 'running') this.phase.step = step
+        const toolRecovery = new ToolCallRecovery()
+        const stopRecovery = this.ctx.on('session/event', (session, event) => {
+          if (session === this.session) toolRecovery.observe(event)
+        })
+        const open: DriverStep = { turn, step, decision, toolRecovery, stopRecovery, closed: false }
+        current = open
+        return this.requestDriverAssistant(turn, step, decision, signal)
+      },
+      executeTool: async (call: ToolCallBlock) => {
+        const open = requireStep()
+        signal.throwIfAborted()
+        try {
+          const batch = await this.loopCtx.tools.execute({
+            calls: [call],
+            signal,
+            agent: this,
+            log: { turn, step: open.step },
+            maxParallelToolCalls: 1,
+            toolSet: open.decision.toolSet,
+          })
+          for (const context of batch.additionalContexts) {
+            this.inbox.splice('next-step', this.inbox.nextStep.length, 0, [context])
+          }
+          if (batch.concluded) concluded = true
+          const settled = batch.results.find(result => result.callId === call.id) ?? batch.results[0]
+          if (settled === undefined) throw new Error(`agent "${this.id}": tool executor returned no result for "${call.id}"`)
+          return createToolResultMessage({
+            callId: call.id,
+            content: settled.result.content,
+            isError: settled.result.isError,
+          })
+        } catch (error: unknown) {
+          if (!(error instanceof ToolBatchExecutionError)) throw error
+          for (const context of error.partial.additionalContexts) {
+            this.inbox.splice('next-step', this.inbox.nextStep.length, 0, [context])
+          }
+          if (error.partial.concluded) concluded = true
+          throw error.cause
+        }
+      },
+      rejectTool: async (call: ToolCallBlock, message: string, code: string) => {
+        const open = requireStep()
+        signal.throwIfAborted()
+        const result = createToolResultMessage({
+          callId: call.id,
+          content: [{ type: 'text', text: message }],
+          isError: true,
+        })
+        // A rejected call never enters the executor, so the driver records the
+        // call/result pair itself to preserve durable tool pairing.
+        const callSeq = this.session.append('tool/call', {
+          turn, step: open.step, callId: call.id, name: call.name, arguments: call.arguments,
+        })
+        this.session.append('tool/result', {
+          turn,
+          step: open.step,
+          message: result,
+          error: { name: code, code },
+        }, { surfaceOp: 'append', sourceEventSeqs: [callSeq.seq] })
+        return result
+      },
+      completeStep: async () => { await this.closeDriverStep(current) },
+      shouldConcludeTurn: () => concluded,
+      pendingSteering: () => this.inbox.nextStep,
+      hasPendingSteering: () => this.inbox.nextStep.length > 0,
+      notifyStopping: async () => {
+        signal.throwIfAborted()
+        if (this.inbox.nextStep.length === 0) {
+          await this.dispatch.serial('agent/turn-stopping', { turn, signal })
+          signal.throwIfAborted()
+        }
+        return this.inbox.nextStep.length > 0
+      },
+    }
+  }
+
+  /** Close one open driver step exactly once, recovering any unpaired tool call. */
+  private async closeDriverStep(open: DriverStep | undefined): Promise<void> {
+    if (open === undefined || open.closed) return
+    open.closed = true
+    let failure: unknown
+    try {
+      try {
+        for (const event of open.toolRecovery.results()) {
+          this.session.append('tool/result', event.data, {
+            surfaceOp: 'append',
+            ...event.sourceEventSeqs === undefined ? {} : { sourceEventSeqs: event.sourceEventSeqs },
+          })
+        }
+      } catch (error: unknown) {
+        failure = error
+      }
+      this.session.append('step/end', { turn: open.turn, step: open.step })
+    } catch (error: unknown) {
+      if (failure === undefined) failure = error
+      else failure = new AggregateError([failure, error], 'Driver step failed and its close could not be recorded')
+    } finally {
+      open.stopRecovery()
+      open.decision.toolSet.dispose()
+    }
+    if (failure !== undefined) throw failure
+  }
+
+  /**
+   * Run one native assistant request inside an already-open driver step.
+   * Mirrors the native step's request admission, stream settlement and retry,
+   * but returns the exact response to the custom driver instead of executing tools.
+   */
+  private async requestDriverAssistant(
+    turn: number,
+    step: number,
+    decision: Extract<PreparedStep, { kind: 'enter' }>,
+    signal: AbortSignal,
+  ): Promise<DriverAssistantAdmission> {
+    const { assembly } = decision
+    const renderedPrompt = renderPrompt(assembly)
+    let firstAttempt = true
+    while (true) {
+      const { config, preparedCall } = await this.prepareRequest(turn, step, decision.selection, signal)
+      const currentContext = this.loopCtx.systemPrompt.refreshContext(assembly, {
+        ...assembleContextFor(this, signal), modelSelection: decision.selection,
+      })
+      const sections = renderContextSections(currentContext)
+      const context = this.runtimeContext.project(joinContextSections(sections), sections)
+      signal.throwIfAborted()
+      const startsRequestSeries = firstAttempt && decision.startsRequestSeries === true
+      const commits = this.systemPrompt.project(renderedPrompt, {
+        inHistory: preparedCall?.systemPromptUpdate === 'in-history',
+        startsSeries: startsRequestSeries
+          || this.requestSurfaceGeneration !== this.session.surface.contentGeneration
+          || (preparedCall?.toolUpdate === undefined && this.toolsChanged(assembly.tools)),
+      })
+      for (const { message, intent } of commits) {
+        this.session.append('system/message', { turn, step, message }, intent)
+      }
+      let contextAdmitted = false
+      if (firstAttempt) {
+        for (const message of decision.messages) {
+          if (message.source.kind === 'runtime-context') {
+            if (context !== undefined && !contextAdmitted) {
+              this.session.append('user/message', context, { surfaceOp: 'append' })
+              contextAdmitted = true
+            }
+          } else {
+            this.session.append('user/message', message, { surfaceOp: 'append' })
+          }
+        }
+      }
+      if (context !== undefined && !contextAdmitted) {
+        this.session.append('user/message', context, { surfaceOp: 'append' })
+      }
+      firstAttempt = false
+      const request = this.buildRequest(config, preparedCall, assembly.tools, { turn, step }, startsRequestSeries, signal)
+      const live = new AssistantStreamAttempt(
+        this.session.id,
+        ++this.assistantAttemptCounter,
+        () => ++this.assistantStreamRevision,
+        turn,
+        step,
+        (frame) => { this.dispatch.emit('agent/assistant-stream', { frame }) },
+      )
+      let started = false
+      try {
+        const stream = preparedCall?.stream(request) ?? this.loopCtx.llm.stream(request)
+        signal.throwIfAborted()
+        live.start()
+        started = true
+        for await (const chunk of stream) {
+          signal.throwIfAborted()
+          live.push(chunk)
+        }
+        signal.throwIfAborted()
+      } catch (error: unknown) {
+        if (!started) throw error
+        try {
+          if (signal.aborted) {
+            const content = live.interruptedBlocks()
+            if (content.length > 0) {
+              live.settle('assistant/message', () => this.session.append('assistant/message', {
+                turn,
+                step,
+                message: createAssistantMessage({
+                  content,
+                  source: {
+                    provider: request.provider,
+                    model: request.model,
+                    ...live.replayState === undefined ? {} : { replayState: live.replayState },
+                  },
+                }),
+                interrupted: true,
+                ...live.usage === undefined ? {} : { usage: live.usage },
+                stream: live.stream,
+              }, { surfaceOp: 'append' }).seq)
+            } else {
+              live.settle(
+                'assistant/attempt',
+                () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
+              )
+            }
+          } else {
+            live.settle(
+              'assistant/attempt',
+              () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
+            )
+          }
+        } catch (settlementError: unknown) {
+          throw new AggregateError(
+            [error, settlementError],
+            'Assistant stream failed and its durable settlement was rejected',
+            { cause: error },
+          )
+        }
+        throw error
+      }
+      try {
+        const finish = live.finish
+        if (finish.kind === 'error' || finish.kind === 'aborted') {
+          live.settle(
+            'assistant/attempt',
+            () => this.session.append('assistant/attempt', { turn, step, stream: live.stream }).seq,
+          )
+          const action = await this.dispatch.waterfall(
+            'agent/request-error', {
+              turn,
+              step,
+              provider: request.provider,
+              failure: finish.failure,
+              retryPolicy: preparedCall?.retryPolicy,
+              signal,
+            },
+            () => Promise.resolve<RequestErrorAction>(undefined),
+          )
+          signal.throwIfAborted()
+          if (action?.kind !== 'retry') {
+            throw new LlmError(finish.failure.message, finish.failure.code, finish.failure)
+          }
+          continue
+        }
+        const message = createAssistantMessage({
+          content: live.blocks(),
+          source: {
+            provider: request.provider,
+            model: request.model,
+            ...live.replayState !== undefined ? { replayState: live.replayState } : {},
+          },
+        })
+        live.settle(
+          'assistant/message',
+          () => this.session.append('assistant/message', {
+            turn,
+            step,
+            message,
+            ...live.usage === undefined ? {} : { usage: live.usage },
+            stream: live.stream,
+          }, { surfaceOp: 'append' }).seq,
+        )
+        return {
+          kind: 'response',
+          message,
+          finish,
+          request,
+          ...preparedCall?.context?.contextWindow === undefined ? {} : { contextWindow: preparedCall.context.contextWindow },
+          ...request.maxTokens === undefined ? {} : { defaultMaxTokens: request.maxTokens },
+          ...live.usage === undefined ? {} : { usage: live.usage },
+        }
+      } catch (error: unknown) {
+        if (!live.ended) live.abandon()
+        throw error
+      }
+    }
   }
 
   private async step(decision: Extract<PreparedStep, { kind: 'enter' }>): Promise<StepEndReason | null> {
