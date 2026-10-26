@@ -4,7 +4,7 @@ import type { ToolCallBlock, ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type { PromptSection, ToolProviderResult } from '@deepseek-ai/dsh-system-prompt'
-import type { ResolvedToolSet, ToolDefinition, ToolExecutionResult } from './contracts.ts'
+import type { ResolvedToolSet, ToolDefinition, ToolExecutionResult, ToolExecutionToken } from './contracts.ts'
 
 /** Model-call schemas produced by an executor. */
 export type ToolModelInput = Pick<ToolProviderResult, 'schemas' | 'knownNames'>
@@ -19,6 +19,18 @@ export interface ToolPromptSection extends Pick<PromptSection, 'name' | 'order' 
 export interface ToolBatchInput {
   readonly calls: readonly ToolCallBlock[]
   readonly signal: AbortSignal
+  /**
+   * Root model-requested call owning every call in this batch. A programmatic
+   * nested batch uses the enclosing execution's root; omission derives each
+   * call's own id. Only meaningful for single-call nested dispatch.
+   */
+  readonly rootCallId?: ToolCallId
+  /**
+   * Opaque token of the enclosing transport execution for a programmatic
+   * nested batch. Selects nested admission and keeps policy correlation.
+   * Omit for root model batches.
+   */
+  readonly parent?: ToolExecutionToken
   /**
    * Positive integer overriding the executor's concurrency limit for this batch.
    * Applies to concurrency-safe root calls; program subcall limits remain separate.
