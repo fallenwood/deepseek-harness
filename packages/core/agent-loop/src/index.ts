@@ -32,7 +32,10 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import { scopeChainOf, scopeOf } from '@deepseek-ai/dsh-scope'
+import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import { ReactLoopAgent } from './agent.ts'
+import type { TurnDriver } from './agent.ts'
 import { inboxProjectionDefinition } from './inbox.ts'
 import { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from './constants.ts'
 import type {} from './runtime-context.ts'
@@ -201,6 +204,7 @@ declare module '@deepseek-ai/cordis' {
 }
 
 export { DEFAULT_MAX_PARALLEL_TOOL_CALLS }
+export type { DriverAssistantAdmission, TurnDriver, TurnDriverIO, TurnDriverResult } from './agent.ts'
 
 /**
  * One launcher-selected session identity for a configured agent. `resume`
@@ -313,6 +317,8 @@ export class AgentLoop extends Service implements AgentFactory {
   private readonly runtime: { ctx: Context }
   private modelProjectionHandle!: ProjectionHandle<ModelSelectionProjectionState>
   private inboxProjectionHandle!: ProjectionHandle<InboxState>
+  /** Custom drivers keyed by the exact scope that registered them (an Agent or preset scope). */
+  private readonly turnDrivers = new Map<object, TurnDriver>()
 
   constructor(ctx: Context, config: Config) {
     super(ctx, 'agentLoop')
@@ -368,6 +374,45 @@ export class AgentLoop extends Service implements AgentFactory {
         return fiber.dispose
       }, `agentLoop.resume(${id})`)
     }
+  }
+
+  /**
+   * Install a custom model/tool repetition driver for the Agent that owns `agentCtx`.
+   * Called by an agent-scoped plugin during Agent setup; the returned disposer is
+   * normally registered through that scope's `ctx.effect`.
+   * @param agentCtx - context inside the target Agent's scope.
+   * @param driver - native-loop replacement for that Agent's future turns.
+   * @returns disposer that removes the driver if it is still installed.
+   */
+  registerTurnDriver(scopeCtx: Context, driver: TurnDriver): () => void {
+    const key = scopeOf(scopeCtx)
+    if (key === undefined) {
+      throw new Error('agentLoop.registerTurnDriver requires a scoped context')
+    }
+    if (this.turnDrivers.has(key)) {
+      throw new Error('agentLoop.registerTurnDriver: this scope already has a custom turn driver')
+    }
+    this.turnDrivers.set(key, driver)
+    return () => {
+      if (this.turnDrivers.get(key) === driver) this.turnDrivers.delete(key)
+    }
+  }
+
+  /**
+   * Resolve the custom driver that governs one Agent. A driver may be registered
+   * by the Agent's own scope or by an enclosing preset scope; the nearest
+   * ancestor wins, matching how scoped services resolve.
+   * @param agentCtx - the Agent's scoped context.
+   * @returns the installed driver, or undefined when the native loop should run.
+   */
+  turnDriverFor(agentCtx: Context): TurnDriver | undefined {
+    const key: ScopeKey | undefined = scopeOf(agentCtx)
+    if (key === undefined) return undefined
+    for (const cursor of scopeChainOf(key)) {
+      const driver = this.turnDrivers.get(cursor)
+      if (driver !== undefined) return driver
+    }
+    return undefined
   }
 
   private applyConfiguredRoute(agent: Agent, options: AgentOptions): void {
